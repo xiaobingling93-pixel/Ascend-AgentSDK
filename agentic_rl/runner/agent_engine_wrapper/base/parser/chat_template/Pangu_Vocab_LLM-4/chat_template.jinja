@@ -1,0 +1,202 @@
+{%- set ns = namespace(is_first_tool=true) %}
+{%- set ns2 = namespace(last_user_index=-1) %}
+{%- if not tools is defined %}
+    {%- set tools = none %}
+{%- endif %}
+{%- if not think is defined %}
+    {%- set think = true %}
+{%- endif %}
+{%- if not interleaved_think is defined %}
+    {%- set interleaved_think = false %}
+{%- endif %}
+{%- if not think %}
+    {%- set interleaved_think = false %}
+{%- endif %}
+{%- if not reasoning_effort is defined %}
+    {%- set reasoning_effort = "high" %}
+{%- endif %}
+
+{{- '<|pangu_text_start|><|message_start|>系统：' -}}
+{#- 提取系统消息 #}
+{%- set system_message = "" %}
+{%- if messages[0]['role'] == 'system' %}
+    {%- set system_message =  (messages[0]['content'] | default('', true)) |trim %}
+    {%- set messages = messages[1:] %}
+{%- endif %}
+{#- 调用工具时的默认人设 #}
+{%- if tools %}
+    {%- if system_message %}
+        {%- set system_message = system_message + "\n" %}
+    {%- endif %}
+    {%- set system_message = system_message + "你是一个能够调用外部工具解决问题的专家，你的目标是高效、准确、清晰地完成任务。\n你需要根据用户的问题，决定是否需要使用工具来完成任务。如果需要，请以明确的格式调用工具；如果不需要，请直接回答。\n你可以根据上下文决定是否继续调用工具或基于已有结果直接回答用户。如果工具调用已足够，请合理组织语言向用户汇报结论。在没有获得显式的调用结果之前，在调用工具的当轮回复之内严禁虚构或者假设一个工具调用结果来完成任务或者回答问题。也不应在没有返回工具调用信息的情况下，在调用工具的当轮假设或者明确声称工具执行成功。" %}
+{%- endif %}
+{#- 思维链分档 #}
+{%- if reasoning_effort == "low" and think %}
+    {%- if system_message or tools %}
+        {%- set system_message = "<meta>\n<reasoning>\neffort: compact\n</reasoning>\n</meta>\n\n" + system_message %}
+    {%- else %}
+        {%- set system_message = "<meta>\n<reasoning>\neffort: compact\n</reasoning>\n</meta>" %}
+    {%- endif %}
+{%- endif %}
+{{- system_message -}}
+
+{#- 工具使用描述和规范调用格式 #}
+{%- if tools %}
+    {{- '\n你将在<tools></tools>标签对内获得每个工具的描述：\n<tools>\n' }}
+    {{- tools | tojson(ensure_ascii=False, sort_keys=False) }}
+    {{- '\n</tools>\n' }}
+    {{- "对于每个函数调用，返回一个 JSON 对象，放在 <|tool_call_start|><|tool_call_end|> 标签对中，多个调用组成一个列表，其中每个函数包含函数名和对应函数的参数，格式如下：\n" }}
+    {{- '<|tool_call_start|>\n[{"name": "<函数名1>", "arguments": <args1 json对象>}, {"name": "<函数名2>", "arguments": <args2 json对象>}, ...]\n<|tool_call_end|>' }}
+    {{- '\n<工具使用原则>\n1. 只有在所有必填参数(required字段中列出的)都具备有效值时，才能调用该函数\n2. 如果缺少任何必填参数，必须向用户询问缺失的参数，而不是直接调用函数\n3. 可选参数如果没有提供可以忽略或使用默认值\n</工具使用原则>' }}
+{%- endif %}
+
+{%- if messages | length == 0 and not think %}
+    {{- " /no_think" -}}
+{%- endif %}
+{{- '<|message_end|>' -}}
+
+{#- 找最后一轮user的位置 #}
+{%- for m in messages %}
+    {%- if m.role == 'user' %}
+        {%- set ns2.last_user_index = loop.index0 -%}
+    {%- endif %}
+{%- endfor %}
+
+{#- messages的拼接 #}
+{%- if messages | length != 0 %}
+    {%- for message in messages[:-1] %}
+        {%- if message['role'] == 'user' %}
+            {{- '<|message_start|>用户：' + (message['content'] | default('', true)) -}}
+            {%- if message.get('tool_calls') %}
+                {{- '<|tool_call_start|>\n[' }}
+                {%- set function_list = message.tool_calls | selectattr('function') | map(attribute='function') | list %}
+                {%- for function_item in function_list %}
+                    {%- if not ns.is_first_tool %}
+                        {{- ', ' -}}
+                    {%- endif %}
+                    {%- if function_item.arguments is string %}
+                        {{- '{"name": "' + function_item.name + '", "arguments": ' + function_item.arguments + '}' -}}
+                    {%- else %}
+                        {{- '{"name": "' + function_item.name + '", "arguments": ' + function_item.arguments | tojson(ensure_ascii=False, sort_keys=False) + '}' -}}
+                    {%- endif %}
+                    {%- set ns.is_first_tool = false %}
+                {%- endfor %}
+                {%- set ns.is_first_tool = true %}
+                {{- ']\n<|tool_call_end|>' }}
+            {%- endif %}
+            {%- if loop.index0 < ns2.last_user_index or not interleaved_think %}
+                {{- " /no_think" -}}
+            {%- else %}
+                {%- if messages[loop.index0 + 1]['role'] != "assistant" %}
+                    {{- " /no_think" -}}
+                {%- endif %}
+            {%- endif %}
+            {{- '<|message_end|>' -}}
+        {%- endif %}
+
+        {%- if message['role'] == 'assistant' %}
+            {%- if loop.index0 > ns2.last_user_index and interleaved_think and 'reasoning_content' in message and message['reasoning_content'] %}
+                {{- '<|message_start|>助手：<think>' + message['reasoning_content'] +'</think>' -}}
+            {%- else %}
+                {{- '<|message_start|>助手：<think></think>' -}}
+            {%- endif %}
+            {{- (message['content'] | default('', true)) -}}
+            {%- if message.get('tool_calls') %}
+                {{- '<|tool_call_start|>\n[' }}
+                {%- set function_list = message.tool_calls | selectattr('function') | map(attribute='function') | list %}
+                {%- for function_item in function_list %}
+                    {%- if not ns.is_first_tool %}
+                        {{- ', ' -}}
+                    {%- endif %}
+                    {%- if function_item.arguments is string %}
+                        {{- '{"name": "' + function_item.name + '", "arguments": ' + function_item.arguments + '}' -}}
+                    {%- else %}
+                        {{- '{"name": "' + function_item.name + '", "arguments": ' + function_item.arguments | tojson(ensure_ascii=False, sort_keys=False) + '}' -}}
+                    {%- endif %}
+                    {%- set ns.is_first_tool = false %}
+                {%- endfor %}
+                {%- set ns.is_first_tool = true %}
+                {{- ']\n<|tool_call_end|>' }}
+            {%- endif %}
+            {{- '<|message_end|>' }}
+        {%- endif %}
+
+        {%- if message['role'] == 'tool' %}
+            {{- '<|message_start|>' -}}
+            {{- '工具：' + (message['content'] | default('', true)) -}}
+            {%- if loop.index0 < ns2.last_user_index or not interleaved_think %}
+                {{- " /no_think" -}}
+            {%- else %}
+                {%- if messages[loop.index0 + 1]['role'] != "assistant" %}
+                    {{- " /no_think" -}}
+                {%- endif %}
+            {%- endif %}
+            {{- '<|message_end|>' -}}
+        {%- endif %}
+    {%- endfor %}
+
+    {#- 处理最后一个角色，判断快慢思考 #}
+    {%- if messages[-1]['role'] == "user" %}
+        {{- '<|message_start|>' -}}
+        {{- '用户：' + (messages[-1]['content'] | default('', true)) -}}
+        {%- if messages[-1].get('tool_calls') %}
+            {{- '<|tool_call_start|>\n[' }}
+            {%- set function_list = messages[-1].tool_calls | selectattr('function') | map(attribute='function') | list %}
+            {%- for function_item in function_list %}
+                {%- if not ns.is_first_tool %}
+                    {{- ', ' -}}
+                {%- endif %}
+                {%- if function_item.arguments is string %}
+                    {{- '{"name": "' + function_item.name + '", "arguments": ' + function_item.arguments + '}' -}}
+                {%- else %}
+                    {{- '{"name": "' + function_item.name + '", "arguments": ' + function_item.arguments | tojson(ensure_ascii=False, sort_keys=False) + '}' -}}
+                {%- endif %}
+                {%- set ns.is_first_tool = false %}
+            {%- endfor %}
+            {%- set ns.is_first_tool = true %}
+            {{- ']\n<|tool_call_end|>' }}
+        {%- endif %}
+        {%- if not think %}
+            {{- " /no_think" -}}
+        {%- endif %}
+        {{- '<|message_end|>' -}}
+    {%- endif %}
+    {%- if messages[-1]['role'] == "tool" %}
+        {{- '<|message_start|>' -}}
+        {{- '工具：' + (messages[-1]['content'] | default('', true)) -}}
+        {%- if not think %}
+            {{- " /no_think" -}}
+        {%- endif %}
+        {{- '<|message_end|>' -}}
+    {%- endif %}
+    {%- if messages[-1]['role'] == "assistant" %}
+        {%- if interleaved_think and 'reasoning_content' in messages[-1] and messages[-1]['reasoning_content'] %}
+            {{- '<|message_start|>助手：<think>' + messages[-1]['reasoning_content'] +'</think>' + (messages[-1]['content'] | default('', true)) -}}
+        {%- else %}
+            {{- '<|message_start|>助手：<think></think>' + (messages[-1]['content'] | default('', true)) -}}
+        {%- endif %}
+        {%- if messages[-1].get('tool_calls') %}
+            {{- '<|tool_call_start|>\n[' }}
+            {%- set function_list = messages[-1].tool_calls | selectattr('function') | map(attribute='function') | list %}
+            {%- for function_item in function_list %}
+                {%- if not ns.is_first_tool %}
+                    {{- ', ' -}}
+                {%- endif %}
+                {%- if function_item.arguments is string %}
+                    {{- '{"name": "' + function_item.name + '", "arguments": ' + function_item.arguments + '}' -}}
+                {%- else %}
+                    {{- '{"name": "' + function_item.name + '", "arguments": ' + function_item.arguments | tojson(ensure_ascii=False, sort_keys=False) + '}' -}}
+                {%- endif %}
+                {%- set ns.is_first_tool = false %}
+            {%- endfor %}
+            {%- set ns.is_first_tool = true %}
+            {{- ']\n<|tool_call_end|>' }}
+        {%- endif %}
+        {%- if not think %}
+            {{- " /no_think" -}}
+        {%- endif %}
+        {{- '<|message_end|>' -}}
+    {%- endif %}
+{%- endif %}
+
+{{- '<|message_start|>助手：' -}}
